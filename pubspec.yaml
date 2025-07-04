@@ -1,0 +1,15 @@
+name: flavor_mate
+description: A Dart CLI for managing Flutter flavors with production-grade Android and iOS automation.
+version: 0.1.0
+
+environment:
+  sdk: '>=2.19.0 <4.0.0'
+
+dependencies:
+  args: ^2.4.0
+  io: any
+  path: any
+  xcodeproj: ^0.2.4
+
+executables:
+  flavor_mate: bin/flavor_mate.dart
