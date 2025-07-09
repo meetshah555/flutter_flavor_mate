@@ -1,18 +1,14 @@
 #!/usr/bin/env ruby
 
 # iOS Flavor Setup Script for Flutter Projects
-# Usage:
-#   gem install xcodeproj
-#   ruby ios_flavor_setup.rb path/to/flavor_configs.json
 
-puts "[DEBUG] Ruby script loaded from: #{__FILE__}"
 gem 'xcodeproj', '= 1.27.0'
 require 'json'
 require 'xcodeproj'
 require 'fileutils'
 require 'rexml/document'
 
-BASE_BUNDLE_ID = 'com.example'  # Change this to your actual base ID
+BASE_BUNDLE_ID = 'com.example' # Customize this for your app
 
 def create_flavor_info_plist(flavor_config, project_root, base_app_name)
   flavor = flavor_config['flavor']
@@ -63,9 +59,30 @@ def create_flavor_info_plist(flavor_config, project_root, base_app_name)
   puts "[INFO] Created Info.plist for #{flavor} at #{info_plist_path}"
 end
 
+def ensure_project_has_configuration(project, config_name)
+  existing = project.build_configurations.find { |c| c.name == config_name }
+  return if existing
+
+  puts "[INFO] Adding project-level build configuration '#{config_name}'"
+
+  base_config = if config_name.include?("Debug")
+                  project.build_configurations.find { |c| c.name.downcase.include?("debug") }
+                elsif config_name.include?("Release")
+                  project.build_configurations.find { |c| c.name.downcase.include?("release") }
+                elsif config_name.include?("Profile")
+                  project.build_configurations.find { |c| c.name.downcase.include?("profile") }
+                end
+
+  new_config = project.new(Xcodeproj::Project::Object::XCBuildConfiguration)
+  new_config.name = config_name
+  new_config.build_settings = base_config&.build_settings&.dup || {}
+
+  project.build_configuration_list.build_configurations << new_config
+end
+
 def duplicate_target(project, base_target, flavor)
   new_target_name = "Runner-#{flavor}"
-  puts "[INFO] Duplicating target: #{base_target.name} -> #{new_target_name}"
+  puts "[INFO] Creating new app target: #{new_target_name}"
 
   new_target = project.new_target(
     base_target.symbol_type,
@@ -77,43 +94,11 @@ def duplicate_target(project, base_target, flavor)
   new_target.product_type = base_target.product_type
 
   product_name = "#{new_target_name}.app"
-  existing_product = project.products_group.children.find { |child| child.display_name == product_name }
-  new_target.product_reference = existing_product || project.products_group.new_file(product_name)
+  new_target.product_reference = project.products_group.new_file(product_name)
 
-  puts "[INFO] Copying build phases..."
-  new_target.build_phases.clear
-  base_target.build_phases.each do |base_phase|
-    begin
-      new_phase = project.new(base_phase.isa)
-
-      new_phase.name = base_phase.name if new_phase.respond_to?(:name=) && base_phase.respond_to?(:name)
-
-      if base_phase.respond_to?(:shell_script) && new_phase.respond_to?(:shell_script=)
-        new_phase.shell_script = base_phase.shell_script
-      end
-
-      base_phase.files.each do |file|
-        new_phase.add_file_reference(file.file_ref, true) if file.file_ref
-      end
-
-      new_target.build_phases << new_phase
-    rescue => e
-      puts "[WARNING] Could not copy phase: #{e.message}"
-    end
-  end
-
-  puts "[INFO] Copying build configurations..."
-  new_target.build_configuration_list.build_configurations.clear
-  base_target.build_configurations.each do |config|
-    new_config = project.new(Xcodeproj::Project::Object::XCBuildConfiguration)
-    new_config.name = config.name
-    new_config.build_settings = config.build_settings.dup
-    new_target.build_configuration_list.build_configurations << new_config
-  end
-
-  puts "[INFO] Copying target dependencies..."
-  base_target.dependencies.each do |dep|
-    new_target.add_dependency(dep.target) if dep.target
+  puts "[INFO] Adding Sources, Resources, Frameworks phases..."
+  %w[Sources Resources Frameworks].each do |phase|
+    new_target.build_phases << project.new(Xcodeproj::Project::Object.const_get("PBX#{phase}BuildPhase"))
   end
 
   new_target
@@ -121,6 +106,7 @@ end
 
 def create_build_configurations(project, target, flavor, base_app_name)
   puts "[INFO] Updating build configurations for #{target.name}"
+
   bundle_id_suffix = ".#{flavor}"
   bundle_identifier = "#{BASE_BUNDLE_ID}.#{base_app_name.downcase}#{bundle_id_suffix}"
 
@@ -140,6 +126,9 @@ def create_build_configurations(project, target, flavor, base_app_name)
 
     config.name = new_name
     puts "[INFO] Renamed build configuration '#{original_name}' to '#{new_name}'"
+
+    # ✅ Ensure matching config exists in project-level
+    ensure_project_has_configuration(project, new_name)
   end
 end
 
@@ -147,46 +136,28 @@ def create_scheme(project, target, flavor)
   puts "[INFO] Creating scheme for #{flavor}..."
 
   schemes_dir = Xcodeproj::XCScheme.shared_data_dir(project.path)
-  original_scheme_path = File.join(schemes_dir, 'Runner.xcscheme')
+  FileUtils.mkdir_p(schemes_dir)
+
   new_scheme_path = File.join(schemes_dir, "#{flavor}.xcscheme")
 
-  unless File.exist?(original_scheme_path)
-    raise "Runner.xcscheme not found at #{original_scheme_path}"
-  end
+  scheme = Xcodeproj::XCScheme.new
 
-  # Copy the original
-  FileUtils.cp(original_scheme_path, new_scheme_path)
+  # Add the target to the Build action
+  scheme.add_build_target(target)
 
-  # Patch it
-  xml = REXML::Document.new(File.read(new_scheme_path))
+  # Set build configurations
+  scheme.launch_action.build_configuration = "Debug-#{flavor}"
+  scheme.test_action.build_configuration = "Debug-#{flavor}"
+  scheme.profile_action.build_configuration = "Release-#{flavor}"
+  scheme.analyze_action.build_configuration = "Debug-#{flavor}"
+  scheme.archive_action.build_configuration = "Release-#{flavor}"
 
-  xml.elements.each('//BuildableReference') do |node|
-    node.attributes['BlueprintIdentifier'] = target.uuid
-    node.attributes['BuildableName'] = target.product_reference.path
-    node.attributes['BlueprintName'] = target.name
-    node.attributes['ReferencedContainer'] = "container:#{project.path.basename}"
-  end
+  # Save it
+  scheme.save_as(project.path, flavor, true)
 
-  xml.elements.each('//LaunchAction') do |node|
-    node.attributes['buildConfiguration'] = "Debug-#{flavor}"
-  end
-  xml.elements.each('//TestAction') do |node|
-    node.attributes['buildConfiguration'] = "Debug-#{flavor}"
-  end
-  xml.elements.each('//ProfileAction') do |node|
-    node.attributes['buildConfiguration'] = "Release-#{flavor}"
-  end
-  xml.elements.each('//AnalyzeAction') do |node|
-    node.attributes['buildConfiguration'] = "Debug-#{flavor}"
-  end
-  xml.elements.each('//ArchiveAction') do |node|
-    node.attributes['buildConfiguration'] = "Release-#{flavor}"
-  end
-
-  File.open(new_scheme_path, 'w') { |f| xml.write(f, 2) }
-
-  puts "[INFO] Created duplicated scheme at #{new_scheme_path}"
+  puts "[INFO] Created Xcode scheme: #{new_scheme_path}"
 end
+
 
 # --- MAIN EXECUTION ---
 
@@ -251,14 +222,12 @@ begin
   end
 
   runner_scheme_path = File.join(Xcodeproj::XCScheme.shared_data_dir(project.path), 'Runner.xcscheme')
-  if File.exist?(runner_scheme_path)
-    FileUtils.rm(runner_scheme_path)
-    puts "\n[INFO] Removed original 'Runner' scheme."
-  end
+  FileUtils.rm(runner_scheme_path) if File.exist?(runner_scheme_path)
+  puts "\n[INFO] Removed original 'Runner' scheme."
 
   project.save
   puts "\n✅ [SUCCESS] iOS flavor setup complete!"
-  puts "[INFO] If you encounter issues, restore from backup: #{backup_path}"
+  puts "[INFO] You can now open Xcode and select the dev/stage scheme."
 
 rescue => e
   puts "\n❌ [ERROR] Script failed: #{e.message}"
