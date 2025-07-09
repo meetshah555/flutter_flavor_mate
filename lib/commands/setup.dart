@@ -38,8 +38,6 @@ Future<void> runSetup() async {
   print('After setup, place them here:');
   print('- Android: android/app/src/flavors/<flavor>/google-services.json');
   print('- iOS: ios/Runner/flavors/<flavor>/GoogleService-Info.plist');
-  print('\n⚠️  For iOS flavor automation, you must have XcodeGen installed.');
-  print('  Install it with: brew install xcodegen');
   print('');
   // Require explicit y/n confirmation
   while (true) {
@@ -55,14 +53,6 @@ Future<void> runSetup() async {
       }
     }
     print('Please enter "y" or "n".');
-  }
-
-  // Check if xcodegen is installed before iOS setup
-  final xcodegenCheck = await Process.run('which', ['xcodegen']);
-  if ((xcodegenCheck.stdout as String).trim().isEmpty) {
-    print('❌ XcodeGen is not installed. Please install it with: brew install xcodegen');
-    print('Aborting setup.');
-    return;
   }
 
   // 3️⃣ App name detection

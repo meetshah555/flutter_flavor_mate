@@ -1,9 +1,10 @@
 import 'dart:io';
-import 'package:xcodeproj/xcodeproj.dart';
 import 'package:path/path.dart' as p;
+import 'dart:convert';
+import 'dart:isolate';
 
 Future<void> updateIOSFlavors(List<Map<String, dynamic>> configs) async {
-  print('✅ [iOS] Applying XcodeGen flavor configuration...');
+  print('✅ [iOS] Applying flavor configuration using Ruby xcodeproj script...');
 
   final iosDir = Directory('ios');
   if (!iosDir.existsSync()) {
@@ -17,7 +18,7 @@ Future<void> updateIOSFlavors(List<Map<String, dynamic>> configs) async {
     final flavorDir = Directory(p.join('ios', 'Runner', 'flavors', _capitalize(flavor)));
     if (!flavorDir.existsSync()) {
       flavorDir.createSync(recursive: true);
-      print('✅ Created folder: ${flavorDir.path}');
+      print('✅ Created folder:  ${flavorDir.path}');
     }
     final plistPath = p.join(flavorDir.path, 'GoogleService-Info.plist');
     if (!File(plistPath).existsSync()) {
@@ -26,22 +27,34 @@ Future<void> updateIOSFlavors(List<Map<String, dynamic>> configs) async {
     }
   }
 
-  final projectYmlPath = p.join('ios', 'project.yml');
-  final ymlContent = _generateProjectYml(configs);
-  await File(projectYmlPath).writeAsString(ymlContent);
-  print('✅ Generated ios/project.yml');
+  // Write configs to a temp file for the Ruby script
+  final tempFile = File('ios/flavor_configs.json');
+  await tempFile.writeAsString(jsonEncode(configs));
 
-  // Run XcodeGen
-  final result = await Process.run('xcodegen', ['generate', '--spec', 'ios/project.yml', '--project', 'ios']);
+  // Use Isolate.resolvePackageUri to get the absolute path to the Ruby script
+  final scriptUri = await Isolate.resolvePackageUri(
+    Uri.parse('package:flavor_mate/scripts/ios_flavor_setup.rb'),
+  );
+  if (scriptUri == null) {
+    print('❌ Could not resolve the path to ios_flavor_setup.rb in the package.');
+    return;
+  }
+  final rubyScriptPath = scriptUri.toFilePath();
+
+  // Call the Ruby script using the absolute path
+  final result = await Process.run(
+    'ruby',
+    [rubyScriptPath, tempFile.path],
+    runInShell: true,
+  );
+
   stdout.write(result.stdout);
   stderr.write(result.stderr);
-  if (result.exitCode == 0) {
-    print('✅ XcodeGen ran successfully.');
-    await _removePlistFromCopyBundleResources();
-    print('✅ Removed GoogleService-Info.plist from Copy Bundle Resources in project.pbxproj.');
-  } else {
-    print('❌ XcodeGen failed.');
+
+  if (result.exitCode != 0) {
+    throw Exception('iOS flavor setup failed');
   }
+
   print('\n🔔 After setup, run:'
         '\n   flutter pub get'
         '\n   cd ios && pod install && cd ..'
@@ -82,22 +95,38 @@ Future<void> _removePlistFromCopyBundleResources() async {
   await pbxprojFile.writeAsString(finalLines.join('\n'));
 }
 
-Future<void> removeIOSFlavors() async {
-  // Remove iOS flavors folder
-  final iosFlavorsFolder = Directory('ios/Runner/flavors');
-  if (await iosFlavorsFolder.exists()) {
-    await iosFlavorsFolder.delete(recursive: true);
-    print('✅ Deleted ios/Runner/flavors folder');
+Future<void> removeIOSFlavors(String mainFlavor) async {
+  print('✅ [iOS] Removing flavor configuration using Ruby xcodeproj script...');
+
+  final iosDir = Directory('ios');
+  if (!iosDir.existsSync()) {
+    print('❌ iOS directory not found. Skipping iOS flavor removal.');
+    return;
   }
 
-  // Remove iOS project.yml
-  final projectYmlPath = p.join('ios', 'project.yml');
-  if (await File(projectYmlPath).exists()) {
-    await File(projectYmlPath).delete();
-    print('✅ Deleted ios/project.yml');
+  // Use Isolate.resolvePackageUri to get the absolute path to the Ruby script
+  final scriptUri = await Isolate.resolvePackageUri(
+    Uri.parse('package:flavor_mate/scripts/ios_flavor_setup.rb'),
+  );
+  if (scriptUri == null) {
+    print('❌ Could not resolve the path to ios_flavor_setup.rb in the package.');
+    return;
   }
-  // Note: We do NOT regenerate the Xcode project here
-  // The original project.pbxproj will be restored from backup in the remove command
+  final rubyScriptPath = scriptUri.toFilePath();
+
+  // Call the Ruby script in removal mode
+  final result = await Process.run(
+    'ruby',
+    [rubyScriptPath, '--remove', mainFlavor],
+    runInShell: true,
+  );
+
+  stdout.write(result.stdout);
+  stderr.write(result.stderr);
+
+  if (result.exitCode != 0) {
+    throw Exception('iOS flavor removal failed');
+  }
 }
 
 String _generateProjectYml(List<Map<String, dynamic>> configs) {

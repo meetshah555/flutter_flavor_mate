@@ -20,9 +20,17 @@ Future<void> runRemove() async {
     return;
   }
 
+  // Ask user which flavor to keep/restore as Runner
+  stdout.write('\nEnter the main flavor to keep and restore as Runner (e.g. dev): ');
+  final mainFlavor = stdin.readLineSync();
+  if (mainFlavor == null || mainFlavor.trim().isEmpty) {
+    print('❌ No main flavor entered. Aborting.');
+    return;
+  }
+
   await deleteConfigFile();
   await removeFlavorsFromGradle();
-  await removeIOSFlavors();
+  await removeIOSFlavors(mainFlavor.trim());
 
   final flavorsFolder = Directory('android/app/src/flavors');
   if (await flavorsFolder.exists()) {
