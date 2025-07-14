@@ -65,6 +65,32 @@ def get_bundle_id_from_build_settings
   'com.example.app'
 end
 
+def clean_existing_flavor_configs(project)
+  log("Cleaning existing flavor configurations...")
+
+  # Remove flavor configurations from all targets
+  project.targets.each do |target|
+    configs_to_remove = target.build_configuration_list.build_configurations.select do |config|
+      config.name.include?('-') && !['Debug', 'Release'].include?(config.name)
+    end
+
+    configs_to_remove.each do |config|
+      target.build_configuration_list.build_configurations.delete(config)
+      log("Removed config #{config.name} from target #{target.name}")
+    end
+  end
+
+  # Remove flavor configurations from project level
+  project_configs_to_remove = project.build_configuration_list.build_configurations.select do |config|
+    config.name.include?('-') && !['Debug', 'Release'].include?(config.name)
+  end
+
+  project_configs_to_remove.each do |config|
+    project.build_configuration_list.build_configurations.delete(config)
+    log("Removed project config #{config.name}")
+  end
+end
+
 def clear_shared_schemes(project)
   shared_schemes_dir = Xcodeproj::XCScheme.shared_data_dir(project.path)
   return unless Dir.exist?(shared_schemes_dir)
@@ -78,7 +104,11 @@ end
 def should_skip_target(target_name)
   # Skip test targets and other non-main targets
   skip_targets = ['RunnerTests', 'RunnerUITests', 'RunnerTests (iOS)', 'RunnerUITests (iOS)']
-  skip_targets.include?(target_name)
+  return true if skip_targets.include?(target_name)
+  return true if target_name.downcase.include?('test')
+  return true if target_name.downcase.include?('widget')
+  return true if target_name.downcase.include?('extension')
+  false
 end
 
 def ensure_info_plist_exists(plist_full_path, bundle_id, app_name)
@@ -123,10 +153,36 @@ def ensure_info_plist_exists(plist_full_path, bundle_id, app_name)
   log("Auto-created missing Info.plist at #{plist_full_path}")
 end
 
+def ensure_consistent_swift_version(project)
+  log("Ensuring consistent Swift version across all targets...")
+
+  # Get the Swift version from the Runner target
+  runner_target = project.targets.find { |t| t.name == 'Runner' }
+  base_swift_version = nil
+
+  if runner_target
+    debug_config = runner_target.build_configuration_list.build_configurations.find { |c| c.name == 'Debug' }
+    if debug_config
+      base_swift_version = debug_config.build_settings['SWIFT_VERSION'] || '5.0'
+    end
+  end
+
+  base_swift_version ||= '5.0'
+  log("Using Swift version: #{base_swift_version}")
+
+  # Apply consistent Swift version to all targets
+  project.targets.each do |target|
+    target.build_configuration_list.build_configurations.each do |config|
+      config.build_settings['SWIFT_VERSION'] = base_swift_version
+    end
+    log("Updated Swift version for target: #{target.name}")
+  end
+end
+
 def add_flavor_build_config(project, target, base_config, flavor, bundle_id, plist_path)
-  # Skip test targets to avoid Swift version conflicts
-  if should_skip_target(target.name)
-    log("Skipping flavor configuration for #{target.name}")
+  # CRITICAL: Only create flavor configs for the Runner target
+  if target.name != 'Runner'
+    log("Skipping flavor configuration for non-Runner target: #{target.name}")
     return
   end
 
@@ -152,6 +208,10 @@ def add_flavor_build_config(project, target, base_config, flavor, bundle_id, pli
   new_config.build_settings['PRODUCT_BUNDLE_IDENTIFIER'] = bundle_id
   new_config.build_settings['INFOPLIST_FILE'] = plist_path
 
+  # CRITICAL: Keep Flutter's expected build configurations
+  new_config.build_settings['FLUTTER_BUILD_MODE'] = base_config.build_settings['FLUTTER_BUILD_MODE']
+  new_config.build_settings['FLUTTER_TARGET'] = base_config.build_settings['FLUTTER_TARGET'] || 'lib/main.dart'
+
   # Fix signing settings for automatic signing
   new_config.build_settings['CODE_SIGN_STYLE'] = 'Automatic'
   new_config.build_settings['DEVELOPMENT_TEAM'] = base_config.build_settings['DEVELOPMENT_TEAM'] || ''
@@ -167,22 +227,14 @@ def add_flavor_build_config(project, target, base_config, flavor, bundle_id, pli
     new_config.build_settings['CODE_SIGN_IDENTITY[sdk=iphoneos*]'] = 'iPhone Distribution'
   end
 
-  # CRITICAL: Ensure simulator support for custom configurations
-  new_config.build_settings['VALID_ARCHS'] = '$(ARCHS_STANDARD)'
-  new_config.build_settings['ARCHS'] = '$(ARCHS_STANDARD)'
-  new_config.build_settings['EXCLUDED_ARCHS[sdk=iphonesimulator*]'] = ''
-  new_config.build_settings['EXCLUDED_ARCHS[sdk=iphoneos*]'] = 'i386'
-
-  # Ensure proper build settings for simulator
+  # Let the new config inherit most architecture settings from the base config.
+  # Flutter's base configs are usually set up correctly.
+  # We only ensure ONLY_ACTIVE_ARCH is correctly set for Debug.
   if base_config.name.downcase.include?('debug')
     new_config.build_settings['ONLY_ACTIVE_ARCH'] = 'YES'
-    new_config.build_settings['ENABLE_BITCODE'] = 'NO'
-  else
-    new_config.build_settings['ONLY_ACTIVE_ARCH'] = 'NO'
-    new_config.build_settings['ENABLE_BITCODE'] = 'YES'
   end
 
-  # Swift and Objective-C settings
+  # Swift and Objective-C settings - ensure consistency
   new_config.build_settings['SWIFT_OPTIMIZATION_LEVEL'] = base_config.build_settings['SWIFT_OPTIMIZATION_LEVEL']
   new_config.build_settings['SWIFT_VERSION'] = base_config.build_settings['SWIFT_VERSION'] || '5.0'
 
@@ -204,7 +256,13 @@ def add_flavor_build_config(project, target, base_config, flavor, bundle_id, pli
   unless existing_project_config
     project_config = project.new(Xcodeproj::Project::Object::XCBuildConfiguration)
     project_config.name = project_config_name
-    project_config.build_settings.update(project.build_configuration_list.build_configurations.first.build_settings)
+
+    # Copy base project config settings
+    base_project_config = project.build_configuration_list.build_configurations.find { |c| c.name == base_config.name }
+    if base_project_config
+      project_config.build_settings.update(base_project_config.build_settings)
+    end
+
     project.build_configuration_list.build_configurations << project_config
     log("Added project-level configuration: #{project_config_name}")
   end
@@ -213,208 +271,198 @@ end
 def create_scheme(project, target, scheme_name, flavor)
   log("Creating scheme: #{scheme_name} for flavor: #{flavor}")
 
-  begin
-    scheme = Xcodeproj::XCScheme.new
+  # Create scheme directory if it doesn't exist
+  schemes_dir = File.join(project.path, 'xcshareddata', 'xcschemes')
+  FileUtils.mkdir_p(schemes_dir)
 
-    # FIXED: Create buildable reference using proper method for xcodeproj 1.27.0
-    buildable_ref = Xcodeproj::XCScheme::BuildableReference.new
-    buildable_ref.target_referenced_container = "container:#{File.basename(project.path)}"
-    buildable_ref.target_name = target.name
-    buildable_ref.target_proxy_type = target.product_type
-    buildable_ref.target_uuid = target.uuid
-    buildable_ref.buildable_name = "#{target.name}.app"
+  # Create scheme file content manually
+  scheme_content = <<~SCHEME
+    <?xml version="1.0" encoding="UTF-8"?>
+    <Scheme
+       LastUpgradeVersion = "1500"
+       version = "1.3">
+       <BuildAction
+          parallelizeBuildables = "YES"
+          buildImplicitDependencies = "YES">
+          <BuildActionEntries>
+             <BuildActionEntry
+                buildForTesting = "YES"
+                buildForRunning = "YES"
+                buildForProfiling = "YES"
+                buildForArchiving = "YES"
+                buildForAnalyzing = "YES">
+                <BuildableReference
+                   BuildableIdentifier = "primary"
+                   BlueprintIdentifier = "#{target.uuid}"
+                   BuildableName = "#{target.name}.app"
+                   BlueprintName = "#{target.name}"
+                   ReferencedContainer = "container:#{File.basename(project.path)}">
+                </BuildableReference>
+             </BuildActionEntry>
+          </BuildActionEntries>
+       </BuildAction>
+       <TestAction
+          buildConfiguration = "Debug-#{flavor}"
+          selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
+          selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
+          shouldUseLaunchSchemeArgsEnv = "YES">
+          <BuildableProductRunnable
+             runnableDebuggingMode = "0">
+             <BuildableReference
+                BuildableIdentifier = "primary"
+                BlueprintIdentifier = "#{target.uuid}"
+                BuildableName = "#{target.name}.app"
+                BlueprintName = "#{target.name}"
+                ReferencedContainer = "container:#{File.basename(project.path)}">
+             </BuildableReference>
+          </BuildableProductRunnable>
+       </TestAction>
+       <LaunchAction
+          buildConfiguration = "Debug-#{flavor}"
+          selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
+          selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
+          launchStyle = "0"
+          useCustomWorkingDirectory = "NO"
+          ignoresPersistentStateOnLaunch = "NO"
+          debugDocumentVersioning = "YES"
+          debugServiceExtension = "internal"
+          allowLocationSimulation = "YES">
+          <BuildableProductRunnable
+             runnableDebuggingMode = "0">
+             <BuildableReference
+                BuildableIdentifier = "primary"
+                BlueprintIdentifier = "#{target.uuid}"
+                BuildableName = "#{target.name}.app"
+                BlueprintName = "#{target.name}"
+                ReferencedContainer = "container:#{File.basename(project.path)}">
+             </BuildableReference>
+          </BuildableProductRunnable>
+       </LaunchAction>
+       <ProfileAction
+          buildConfiguration = "Release-#{flavor}"
+          shouldUseLaunchSchemeArgsEnv = "YES"
+          savedToolIdentifier = ""
+          useCustomWorkingDirectory = "NO"
+          debugDocumentVersioning = "YES">
+          <BuildableProductRunnable
+             runnableDebuggingMode = "0">
+             <BuildableReference
+                BuildableIdentifier = "primary"
+                BlueprintIdentifier = "#{target.uuid}"
+                BuildableName = "#{target.name}.app"
+                BlueprintName = "#{target.name}"
+                ReferencedContainer = "container:#{File.basename(project.path)}">
+             </BuildableReference>
+          </BuildableProductRunnable>
+       </ProfileAction>
+       <AnalyzeAction
+          buildConfiguration = "Debug-#{flavor}">
+       </AnalyzeAction>
+       <ArchiveAction
+          buildConfiguration = "Release-#{flavor}"
+          revealArchiveInOrganizer = "YES">
+       </ArchiveAction>
+    </Scheme>
+  SCHEME
 
-    # Add build target with proper settings
-    build_entry = Xcodeproj::XCScheme::BuildAction::Entry.new
-    build_entry.buildable_reference = buildable_ref
-    build_entry.build_for_running = true
-    build_entry.build_for_testing = true
-    build_entry.build_for_profiling = true
-    build_entry.build_for_archiving = true
-    build_entry.build_for_analyzing = true
-
-    scheme.build_action.entries << build_entry
-
-    # Set build configurations for different actions
-    scheme.test_action.build_configuration = "Debug-#{flavor}"
-    scheme.launch_action.build_configuration = "Debug-#{flavor}"
-    scheme.profile_action.build_configuration = "Release-#{flavor}"
-    scheme.analyze_action.build_configuration = "Debug-#{flavor}"
-    scheme.archive_action.build_configuration = "Release-#{flavor}"
-
-    # CRITICAL: Set up launch action properly
-    scheme.launch_action.buildable_product_runnable = Xcodeproj::XCScheme::BuildableProductRunnable.new
-    scheme.launch_action.buildable_product_runnable.buildable_reference = buildable_ref
-    scheme.launch_action.buildable_product_runnable.runnable_debugging_mode = "0"
-
-    # Set up test action
-    scheme.test_action.buildable_product_runnable = Xcodeproj::XCScheme::BuildableProductRunnable.new
-    scheme.test_action.buildable_product_runnable.buildable_reference = buildable_ref
-
-    # Set up profile action
-    scheme.profile_action.buildable_product_runnable = Xcodeproj::XCScheme::BuildableProductRunnable.new
-    scheme.profile_action.buildable_product_runnable.buildable_reference = buildable_ref
-    scheme.profile_action.buildable_product_runnable.runnable_debugging_mode = "0"
-
-    # Save the scheme
-    scheme.save_as(project.path, scheme_name, true)
-    log("✅ Created scheme: #{scheme_name}")
-
-  rescue => e
-    log("❌ Failed to create scheme #{scheme_name}: #{e.message}")
-    log("Error details: #{e.class} - #{e.backtrace.first}")
-
-    # Try simpler approach
-    create_scheme_simple(project, target, scheme_name, flavor)
-  end
-end
-
-def create_scheme_simple(project, target, scheme_name, flavor)
-  log("Creating scheme (simple method): #{scheme_name} for flavor: #{flavor}")
-
-  begin
-    # Create scheme directory if it doesn't exist
-    schemes_dir = File.join(project.path, 'xcshareddata', 'xcschemes')
-    FileUtils.mkdir_p(schemes_dir)
-
-    # Create scheme file content manually
-    scheme_content = <<~SCHEME
-      <?xml version="1.0" encoding="UTF-8"?>
-      <Scheme
-         LastUpgradeVersion = "1500"
-         version = "1.3">
-         <BuildAction
-            parallelizeBuildables = "YES"
-            buildImplicitDependencies = "YES">
-            <BuildActionEntries>
-               <BuildActionEntry
-                  buildForTesting = "YES"
-                  buildForRunning = "YES"
-                  buildForProfiling = "YES"
-                  buildForArchiving = "YES"
-                  buildForAnalyzing = "YES">
-                  <BuildableReference
-                     BuildableIdentifier = "primary"
-                     BlueprintIdentifier = "#{target.uuid}"
-                     BuildableName = "#{target.name}.app"
-                     BlueprintName = "#{target.name}"
-                     ReferencedContainer = "container:#{File.basename(project.path)}">
-                  </BuildableReference>
-               </BuildActionEntry>
-            </BuildActionEntries>
-         </BuildAction>
-         <TestAction
-            buildConfiguration = "Debug-#{flavor}"
-            selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
-            selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
-            shouldUseLaunchSchemeArgsEnv = "YES">
-            <BuildableProductRunnable
-               runnableDebuggingMode = "0">
-               <BuildableReference
-                  BuildableIdentifier = "primary"
-                  BlueprintIdentifier = "#{target.uuid}"
-                  BuildableName = "#{target.name}.app"
-                  BlueprintName = "#{target.name}"
-                  ReferencedContainer = "container:#{File.basename(project.path)}">
-               </BuildableReference>
-            </BuildableProductRunnable>
-         </TestAction>
-         <LaunchAction
-            buildConfiguration = "Debug-#{flavor}"
-            selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
-            selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
-            launchStyle = "0"
-            useCustomWorkingDirectory = "NO"
-            ignoresPersistentStateOnLaunch = "NO"
-            debugDocumentVersioning = "YES"
-            debugServiceExtension = "internal"
-            allowLocationSimulation = "YES">
-            <BuildableProductRunnable
-               runnableDebuggingMode = "0">
-               <BuildableReference
-                  BuildableIdentifier = "primary"
-                  BlueprintIdentifier = "#{target.uuid}"
-                  BuildableName = "#{target.name}.app"
-                  BlueprintName = "#{target.name}"
-                  ReferencedContainer = "container:#{File.basename(project.path)}">
-               </BuildableReference>
-            </BuildableProductRunnable>
-         </LaunchAction>
-         <ProfileAction
-            buildConfiguration = "Release-#{flavor}"
-            shouldUseLaunchSchemeArgsEnv = "YES"
-            savedToolIdentifier = ""
-            useCustomWorkingDirectory = "NO"
-            debugDocumentVersioning = "YES">
-            <BuildableProductRunnable
-               runnableDebuggingMode = "0">
-               <BuildableReference
-                  BuildableIdentifier = "primary"
-                  BlueprintIdentifier = "#{target.uuid}"
-                  BuildableName = "#{target.name}.app"
-                  BlueprintName = "#{target.name}"
-                  ReferencedContainer = "container:#{File.basename(project.path)}">
-               </BuildableReference>
-            </BuildableProductRunnable>
-         </ProfileAction>
-         <AnalyzeAction
-            buildConfiguration = "Debug-#{flavor}">
-         </AnalyzeAction>
-         <ArchiveAction
-            buildConfiguration = "Release-#{flavor}"
-            revealArchiveInOrganizer = "YES">
-         </ArchiveAction>
-      </Scheme>
-    SCHEME
-
-    scheme_file = File.join(schemes_dir, "#{scheme_name}.xcscheme")
-    File.write(scheme_file, scheme_content)
-    log("✅ Created scheme file: #{scheme_file}")
-
-  rescue => e
-    log("❌ Failed to create scheme file: #{e.message}")
-    raise e
-  end
+  scheme_file = File.join(schemes_dir, "#{scheme_name}.xcscheme")
+  File.write(scheme_file, scheme_content)
+  log("✅ Created scheme file: #{scheme_file}")
 end
 
 def add_firebase_copy_phase(target)
-  return if target.shell_script_build_phases.any? { |p| p.name == "Copy GoogleService-Info.plist" }
+  # Only add to Runner target
+  return unless target.name == 'Runner'
+
+  # Remove existing Firebase copy phases to avoid duplicates
+  existing_phases = target.shell_script_build_phases.select { |p| p.name == "Copy GoogleService-Info.plist" }
+  existing_phases.each do |phase|
+    target.build_phases.delete(phase)
+    log("Removed existing Firebase copy phase")
+  end
 
   phase = target.new_shell_script_build_phase("Copy GoogleService-Info.plist")
   phase.shell_script = <<~SCRIPT
-    echo "⚡️ Selecting correct GoogleService-Info.plist for ${CONFIGURATION}"
+    echo "⚡️ Running Firebase GoogleService-Info.plist copy phase"
 
-    if [[ "${CONFIGURATION}" == *"dev"* ]]; then
-      if [ -f "${PROJECT_DIR}/Runner/GoogleService-Info-dev.plist" ]; then
-        cp "${PROJECT_DIR}/Runner/GoogleService-Info-dev.plist" "${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/GoogleService-Info.plist"
-        echo "✅ Copied GoogleService-Info-dev.plist"
-      else
-        echo "⚠️ GoogleService-Info-dev.plist not found, using default"
-        cp "${PROJECT_DIR}/Runner/GoogleService-Info.plist" "${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/GoogleService-Info.plist"
-      fi
-    elif [[ "${CONFIGURATION}" == *"stage"* ]]; then
-      if [ -f "${PROJECT_DIR}/Runner/GoogleService-Info-stage.plist" ]; then
-        cp "${PROJECT_DIR}/Runner/GoogleService-Info-stage.plist" "${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/GoogleService-Info.plist"
-        echo "✅ Copied GoogleService-Info-stage.plist"
-      else
-        echo "⚠️ GoogleService-Info-stage.plist not found, using default"
-        cp "${PROJECT_DIR}/Runner/GoogleService-Info.plist" "${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/GoogleService-Info.plist"
-      fi
+    if [ "${TARGET_NAME}" != "Runner" ]; then
+      echo "Skipping copy phase for non-app target: ${TARGET_NAME}"
+      exit 0
+    fi
+
+    PLIST_NAME="GoogleService-Info.plist"
+    DEST="${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/${PLIST_NAME}"
+
+    FLAVOR="${CONFIGURATION##*-}"
+
+    SOURCE="${PROJECT_DIR}/Runner/flavors/${FLAVOR}/${PLIST_NAME}"
+
+    if [ -f "${SOURCE}" ]; then
+      cp "${SOURCE}" "${DEST}"
+      echo "✅ Copied ${SOURCE} to ${DEST}"
     else
-      cp "${PROJECT_DIR}/Runner/GoogleService-Info.plist" "${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/GoogleService-Info.plist"
-      echo "✅ Copied default GoogleService-Info.plist"
+      echo "⚠️ Flavor-specific plist not found for flavor '${FLAVOR}', falling back to default"
+
+      DEFAULT_SOURCE="${PROJECT_DIR}/Runner/${PLIST_NAME}"
+      if [ -f "${DEFAULT_SOURCE}" ]; then
+        cp "${DEFAULT_SOURCE}" "${DEST}"
+        echo "✅ Copied default ${DEFAULT_SOURCE} to ${DEST}"
+      else
+        echo "⚠️ No default ${DEFAULT_SOURCE} found either, skipping copy"
+      fi
     fi
   SCRIPT
 
   log("✅ Added Firebase copy script phase to target")
 end
 
-def update_project_build_settings(project, target, base_bundle_id)
-  # Skip test targets when updating build settings
-  if should_skip_target(target.name)
-    log("Skipping build settings update for #{target.name}")
-    return
+def debug_final_configuration(project, target)
+  log("=== FINAL CONFIGURATION DEBUG ===")
+
+  # Check what configurations were actually created
+  all_configs = target.build_configuration_list.build_configurations
+  flavor_configs = all_configs.select { |c| c.name.include?('-') }
+
+  log("Total configurations: #{all_configs.length}")
+  log("Flavor configurations: #{flavor_configs.length}")
+
+  flavor_configs.each do |config|
+    log("Configuration: #{config.name}")
+    log("  Bundle ID: #{config.build_settings['PRODUCT_BUNDLE_IDENTIFIER']}")
+    log("  Info.plist: #{config.build_settings['INFOPLIST_FILE']}")
+    log("  Code Sign Style: #{config.build_settings['CODE_SIGN_STYLE']}")
+    log("  Flutter Flavor: #{config.build_settings['FLUTTER_FLAVOR']}")
+    log("  Dart Defines: #{config.build_settings['DART_DEFINES']}")
+    log("  Swift Version: #{config.build_settings['SWIFT_VERSION']}")
+    log("  Flutter Build Mode: #{config.build_settings['FLUTTER_BUILD_MODE']}")
+    log("  Flutter Target: #{config.build_settings['FLUTTER_TARGET']}")
+
+    # Check if Info.plist actually exists
+    plist_path = config.build_settings['INFOPLIST_FILE']
+    if plist_path
+      full_path = File.join(IOS_DIR, plist_path)
+      exists = File.exist?(full_path)
+      log("  Info.plist exists: #{exists}")
+      if !exists
+        log("  ❌ MISSING: #{full_path}")
+      end
+    end
+    log("  ---")
   end
+
+  # Check schemes
+  schemes_dir = File.join(XCODEPROJ_PATH, 'xcshareddata', 'xcschemes')
+  if Dir.exist?(schemes_dir)
+    schemes = Dir.glob(File.join(schemes_dir, "*.xcscheme"))
+    log("Schemes created: #{schemes.map { |s| File.basename(s, '.xcscheme') }.join(', ')}")
+  else
+    log("❌ No schemes directory found")
+  end
+end
+
+def update_project_build_settings(project, target, base_bundle_id)
+  # Only update Runner target build settings
+  return unless target.name == 'Runner'
 
   # Update project-level build settings
   project.build_configuration_list.build_configurations.each do |config|
@@ -478,6 +526,28 @@ def update_project_build_settings(project, target, base_bundle_id)
   end
 end
 
+def create_generated_config_file(project, flavors)
+  # Create Generated.xcconfig file that Flutter expects
+  generated_config_path = File.join(IOS_DIR, 'Flutter', 'Generated.xcconfig')
+
+  # Ensure Flutter directory exists
+  FileUtils.mkdir_p(File.dirname(generated_config_path))
+
+  # Read existing content or create new
+  existing_content = ""
+  if File.exist?(generated_config_path)
+    existing_content = File.read(generated_config_path)
+  end
+
+  # Add flavor configurations if not already present
+  flavor_configs = flavors.map { |flavor| "FLAVOR_#{flavor.upcase}=#{flavor}" }.join("\n")
+
+  unless existing_content.include?("FLAVOR_")
+    File.write(generated_config_path, "#{existing_content}\n#{flavor_configs}\n")
+    log("Updated Generated.xcconfig with flavor configurations")
+  end
+end
+
 # ---------------------------------------
 # Script Entry
 if ARGV.length != 1
@@ -523,16 +593,21 @@ backup_path = "#{XCODEPROJ_PATH}.backup.#{Time.now.to_i}"
 FileUtils.cp_r(XCODEPROJ_PATH, backup_path)
 log("Backup created at: #{backup_path}")
 
-# CRITICAL FIX: Process only Runner target to avoid Swift version conflicts
-project.targets.each do |target|
-  next if should_skip_target(target.name)
+# Clean existing flavor configurations first
+clean_existing_flavor_configs(project)
 
-  # Update project build settings to fix signing and simulator issues
-  update_project_build_settings(project, target, base_bundle_id)
+# Clear existing schemes
+clear_shared_schemes(project)
 
-  # Add GoogleService-Info.plist copy phase
-  add_firebase_copy_phase(target)
-end
+# CRITICAL: Ensure consistent Swift version across all targets BEFORE creating new configs
+ensure_consistent_swift_version(project)
+
+# Process only Runner target to update base build settings and add Firebase copy phase
+update_project_build_settings(project, runner_target, base_bundle_id)
+add_firebase_copy_phase(runner_target)
+
+# Extract flavor names for Generated.xcconfig
+flavor_names = flavor_configs.map { |entry| entry['flavor'] }
 
 # Main loop - Process flavors only for Runner target
 flavor_configs.each do |entry|
@@ -556,17 +631,25 @@ flavor_configs.each do |entry|
 
   ensure_info_plist_exists(plist_full_path, bundle_id, app_name)
 
-  # Create flavor-specific build configurations ONLY for Runner target
-  base_configs = runner_target.build_configuration_list.build_configurations.select { |c| !c.name.include?('-') }
+  # Create flavor-specific build configurations only for Runner
+  base_configs = runner_target.build_configuration_list.build_configurations.select do |c|
+    ['Debug', 'Release'].include?(c.name)
+  end
   base_configs.each do |base_config|
     add_flavor_build_config(project, runner_target, base_config, flavor, bundle_id, plist_relative_path)
   end
 
+  # Create scheme
   create_scheme(project, runner_target, scheme_name, flavor)
 end
+
+# Create or update Generated.xcconfig
+create_generated_config_file(project, flavor_names)
+
+debug_final_configuration(project, runner_target)
 
 project.save
 log("✅ Flavors successfully configured!")
 log("🔧 Please restart Xcode to see all changes")
-log("📱 Simulators should now appear in scheme destinations")
+log("📱 Run 'flutter clean' and 'flutter build ios' to regenerate build artifacts")
 puts "[INFO] Restore from backup if needed: #{backup_path}"
