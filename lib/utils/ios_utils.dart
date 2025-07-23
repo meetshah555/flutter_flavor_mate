@@ -61,40 +61,6 @@ Future<void> updateIOSFlavors(List<Map<String, dynamic>> configs) async {
       '\nThen open ios/Runner.xcworkspace in Xcode.');
 }
 
-Future<void> _removePlistFromCopyBundleResources() async {
-  final pbxprojFile = File('ios/Runner.xcodeproj/project.pbxproj');
-  if (!await pbxprojFile.exists()) return;
-  final lines = await pbxprojFile.readAsLines();
-
-  // Step 1: Find all PBXBuildFile IDs for GoogleService-Info.plist
-  final buildFileIdRegex = RegExp(r'\s*([A-F0-9]+) /\* GoogleService-Info.plist in Resources \*/ = \{isa = PBXBuildFile;[^}]*\};');
-  final buildFileIds = <String>{};
-  for (final line in lines) {
-    final match = buildFileIdRegex.firstMatch(line);
-    if (match != null) {
-      buildFileIds.add(match.group(1)!);
-    }
-  }
-
-  // Step 2: Remove PBXBuildFile entries for GoogleService-Info.plist
-  final filteredLines = <String>[];
-  for (final line in lines) {
-    if (buildFileIdRegex.hasMatch(line)) continue; // skip
-    filteredLines.add(line);
-  }
-
-  // Step 3: Remove references to those IDs in PBXResourcesBuildPhase sections
-  final idRefRegex = RegExp(buildFileIds.map((id) => RegExp.escape(id)).join('|'));
-  final finalLines = <String>[];
-  for (final line in filteredLines) {
-    // Remove lines that reference the build file IDs in files = (...)
-    if (idRefRegex.pattern.isNotEmpty && idRefRegex.hasMatch(line)) continue;
-    finalLines.add(line);
-  }
-
-  await pbxprojFile.writeAsString(finalLines.join('\n'));
-}
-
 /// Remove iOS flavors using the Ruby removal script
 ///
 
