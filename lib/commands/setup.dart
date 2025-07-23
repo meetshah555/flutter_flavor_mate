@@ -1,9 +1,8 @@
 import 'dart:io';
-import 'dart:convert';
 
+import '../utils/app_names_utils.dart';
 import '../utils/config_utils.dart';
 import '../utils/gradle_utils.dart';
-import '../utils/app_names_utils.dart';
 import '../utils/ios_utils.dart';
 
 Future<void> runSetup() async {

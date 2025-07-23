@@ -56,9 +56,9 @@ Future<void> updateIOSFlavors(List<Map<String, dynamic>> configs) async {
   }
 
   print('\n🔔 After setup, run:'
-        '\n   flutter pub get'
-        '\n   cd ios && pod install && cd ..'
-        '\nThen open ios/Runner.xcworkspace in Xcode.');
+      '\n   flutter pub get'
+      '\n   cd ios && pod install && cd ..'
+      '\nThen open ios/Runner.xcworkspace in Xcode.');
 }
 
 Future<void> _removePlistFromCopyBundleResources() async {
@@ -95,93 +95,252 @@ Future<void> _removePlistFromCopyBundleResources() async {
   await pbxprojFile.writeAsString(finalLines.join('\n'));
 }
 
-Future<void> removeIOSFlavors(String mainFlavor) async {
-  print('✅ [iOS] Removing flavor configuration using Ruby xcodeproj script...');
+/// Remove iOS flavors using the Ruby removal script
+///
 
+/// Remove iOS flavors using the Ruby removal script
+///
+/// [flavorToKeep] - The flavor to keep as default configuration.
+/// If null or empty, all flavors will be removed (complete restoration).
+Future<void> removeIOSFlavors(String? flavorToKeep) async {
   final iosDir = Directory('ios');
   if (!iosDir.existsSync()) {
     print('❌ iOS directory not found. Skipping iOS flavor removal.');
     return;
   }
 
-  // Use Isolate.resolvePackageUri to get the absolute path to the Ruby script
-  final scriptUri = await Isolate.resolvePackageUri(
-    Uri.parse('package:flavor_mate/scripts/ios_flavor_setup.rb'),
-  );
-  if (scriptUri == null) {
-    print('❌ Could not resolve the path to ios_flavor_setup.rb in the package.');
+  // Check if Runner.xcodeproj exists
+  final xcodeproj = File('ios/Runner.xcodeproj/project.pbxproj');
+  if (!await xcodeproj.exists()) {
+    print('❌ Runner.xcodeproj not found. Skipping iOS flavor removal.');
     return;
   }
-  final rubyScriptPath = scriptUri.toFilePath();
 
-  // Call the Ruby script in removal mode
-  final result = await Process.run(
-    'ruby',
-    [rubyScriptPath, '--remove', mainFlavor],
-    runInShell: true,
+  // Get available flavors first to validate
+  final availableFlavors = await getAvailableIOSFlavors();
+  if (availableFlavors.isEmpty) {
+    print('❌ No flavors found in the project. Nothing to remove.');
+    return;
+  }
+
+  print('✅ [iOS] Available flavors: ${availableFlavors.join(', ')}');
+
+  // Validate flavor choice if provided
+  if (flavorToKeep != null && flavorToKeep.isNotEmpty) {
+    if (!availableFlavors.contains(flavorToKeep)) {
+      print('❌ Invalid flavor name: "$flavorToKeep"');
+      print('❌ Available flavors: ${availableFlavors.join(', ')}');
+      return;
+    }
+    print('✅ [iOS] Keeping "$flavorToKeep" as default configuration and removing all other flavors...');
+  } else {
+    print('✅ [iOS] Removing all flavor configurations and restoring to original state...');
+  }
+
+  // Resolve absolute path to the Ruby removal script in the package
+  final scriptUri = await Isolate.resolvePackageUri(
+    Uri.parse('package:flavor_mate/scripts/ios_flavor_removal.rb'),
   );
 
-  stdout.write(result.stdout);
-  stderr.write(result.stderr);
+  if (scriptUri == null) {
+    print('❌ Could not resolve the path to ios_flavor_removal.rb in the package.');
+    return;
+  }
 
-  if (result.exitCode != 0) {
-    throw Exception('iOS flavor removal failed');
+  final rubyScriptPath = scriptUri.toFilePath();
+
+  // Verify Ruby script exists
+  if (!await File(rubyScriptPath).exists()) {
+    print('❌ Ruby script not found at: $rubyScriptPath');
+    return;
+  }
+
+  // Prepare arguments for Ruby script
+  final args = <String>[rubyScriptPath];
+  if (flavorToKeep != null && flavorToKeep.isNotEmpty) {
+    args.add(flavorToKeep);
+  }
+
+  try {
+    // Call Ruby script with or without flavor argument
+    final result = await Process.run(
+      'ruby',
+      args,
+      runInShell: true,
+      workingDirectory: Directory.current.path,
+    );
+
+    // Output the results
+    if (result.stdout.toString().isNotEmpty) {
+      print(result.stdout);
+    }
+    if (result.stderr.toString().isNotEmpty) {
+      stderr.write(result.stderr);
+    }
+
+    if (result.exitCode != 0) {
+      throw ProcessException(
+        'ruby',
+        args,
+        'iOS flavor removal failed with exit code ${result.exitCode}',
+        result.exitCode,
+      );
+    }
+
+    // CRITICAL FIX: Validate Info.plist exists after removal
+    await _validateInfoPlistExists();
+
+    // CRITICAL FIX: Add this line to clean up any remaining references
+    await _cleanupRemainingReferences();
+
+    // IMPORTANT: Clean up flavor directories ONLY after Ruby script succeeds
+    await _cleanupFlavorDirectories(flavorToKeep);
+
+    print('✅ iOS flavor removal completed successfully');
+
+    // Print next steps
+    print('\n🔔 Next steps:');
+    print('   1. Run: flutter clean');
+    print('   2. Run: cd ios && pod install && cd ..');
+    print('   3. Restart Xcode and rebuild your project');
+
+    if (flavorToKeep != null && flavorToKeep.isNotEmpty) {
+      print('   4. Your "$flavorToKeep" flavor is now the default configuration');
+    } else {
+      print('   4. Project restored to original state (no flavors)');
+    }
+
+  } catch (e) {
+    print('❌ Error during iOS flavor removal: $e');
+    rethrow;
   }
 }
 
-String _generateProjectYml(List<Map<String, dynamic>> configs) {
-  final buffer = StringBuffer();
-  buffer.writeln('name: Runner');
-  buffer.writeln('configs:');
-  for (final config in configs) {
-    final flavor = config['flavor'];
-    buffer.writeln('  Debug-$flavor: debug');
-    buffer.writeln('  Release-$flavor: release');
+
+Future<void> _validateInfoPlistExists() async {
+  final infoPlistFile = File('ios/Runner/Info.plist');
+
+  if (!await infoPlistFile.exists()) {
+    print('⚠️  Info.plist missing, creating default one...');
+
+    const defaultInfoPlist = '''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>\$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>\$(PRODUCT_NAME)</string>
+	<key>CFBundleExecutable</key>
+	<string>\$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>\$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>\$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>\$(FLUTTER_BUILD_NAME)</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>\$(FLUTTER_BUILD_NUMBER)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIMainStoryboardFile</key>
+	<string>Main</string>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+</dict>
+</plist>''';
+
+    await infoPlistFile.writeAsString(defaultInfoPlist);
+    print('✅ Created default Info.plist');
   }
-  buffer.writeln('settings:');
-  buffer.writeln('  base:');
-  buffer.writeln('    PRODUCT_BUNDLE_IDENTIFIER: com.example.runner');
-  buffer.writeln('targets:');
-  buffer.writeln('  Runner:');
-  buffer.writeln('    type: application');
-  buffer.writeln('    platform: iOS');
-  buffer.writeln('    sources: [Runner]');
-  buffer.writeln('    settings:');
-  buffer.writeln('      configs:');
-  for (final config in configs) {
-    final flavor = config['flavor'];
-    final ios = config['iOS'];
-    buffer.writeln('        Debug-$flavor:');
-    buffer.writeln('          PRODUCT_BUNDLE_IDENTIFIER: com.example.runner${ios['bundleIdSuffix']}');
-    buffer.writeln('          PRODUCT_NAME: Runner ${ios['displayNameSuffix']}');
-    buffer.writeln('          GOOGLE_SERVICE_INFO_PLIST_PATH: Runner/flavors/$flavor/GoogleService-Info.plist');
-    buffer.writeln('        Release-$flavor:');
-    buffer.writeln('          PRODUCT_BUNDLE_IDENTIFIER: com.example.runner${ios['bundleIdSuffix']}');
-    buffer.writeln('          PRODUCT_NAME: Runner ${ios['displayNameSuffix']}');
-    buffer.writeln('          GOOGLE_SERVICE_INFO_PLIST_PATH: Runner/flavors/$flavor/GoogleService-Info.plist');
+}
+
+/// Clean up any remaining file references in project.pbxproj
+Future<void> _cleanupRemainingReferences() async {
+  final pbxprojFile = File('ios/Runner.xcodeproj/project.pbxproj');
+  if (!await pbxprojFile.exists()) return;
+
+  String content = await pbxprojFile.readAsString();
+
+  // Remove any remaining flavor directory references
+  final flavorRefRegex = RegExp(r'[^\n]*flavors/[^/]+/[^\n]*\n?');
+  content = content.replaceAll(flavorRefRegex, '');
+
+  // Clean up empty lines
+  content = content.replaceAll(RegExp(r'\n\s*\n\s*\n'), '\n\n');
+
+  await pbxprojFile.writeAsString(content);
+  print('✅ Cleaned up remaining file references in project.pbxproj');
+}
+
+
+/// Clean up flavor directories after successful removal
+Future<void> _cleanupFlavorDirectories(String? flavorToKeep) async {
+  final flavorsDir = Directory('ios/Runner/flavors');
+
+  if (!await flavorsDir.exists()) {
+    return;
   }
-  buffer.writeln('    preBuildScripts:');
-  buffer.writeln('      - name: Copy GoogleService-Info.plist');
-  buffer.writeln('        script: |');
-  buffer.writeln('          FLAVOR=\$(echo "\${CONFIGURATION}" | sed -E "s/^(Debug|Release)-//")');
-  buffer.writeln('          PLIST_PATH="\${SRCROOT}/Runner/flavors/\${FLAVOR}/GoogleService-Info.plist"');
-  buffer.writeln('          if [ -f "\$PLIST_PATH" ]; then');
-  buffer.writeln('            cp "\$PLIST_PATH" "\${BUILT_PRODUCTS_DIR}/\${PRODUCT_NAME}.app/GoogleService-Info.plist"');
-  buffer.writeln('          else');
-  buffer.writeln('            echo "warning: GoogleService-Info.plist for flavor \$FLAVOR not found!"');
-  buffer.writeln('          fi');
-  buffer.writeln('    # Note: GoogleService-Info.plist is NOT included in resources to avoid "Multiple commands produce" error. The plist is copied via the preBuildScript above');
-  buffer.writeln('schemes:');
-  for (final config in configs) {
-    final flavor = config['flavor'];
-    buffer.writeln('  $flavor:');
-    buffer.writeln('    build:');
-    buffer.writeln('      targets:');
-    buffer.writeln('        Runner: all');
-    buffer.writeln('    run:');
-    buffer.writeln('      config: Debug-$flavor');
+
+  if (flavorToKeep == null || flavorToKeep.isEmpty) {
+    // Remove entire flavors directory if no flavor is kept
+    await flavorsDir.delete(recursive: true);
+    print('✅ Removed ios/Runner/flavors directory');
+  } else {
+    // For selective removal, we ALWAYS remove the entire flavors directory
+    // because the kept flavor is now set up as the default configuration
+    // and its files have been copied to the main Runner directory
+    await flavorsDir.delete(recursive: true);
+    print('✅ Removed ios/Runner/flavors directory (flavor "$flavorToKeep" is now default configuration)');
   }
-  return buffer.toString();
+}
+
+/// Get list of available flavors from iOS directory
+Future<List<String>> getAvailableIOSFlavors() async {
+  final flavors = <String>[];
+  final flavorsDir = Directory('ios/Runner/flavors');
+
+  if (!await flavorsDir.exists()) {
+    return flavors;
+  }
+
+  await for (final entity in flavorsDir.list()) {
+    if (entity is Directory) {
+      final flavorName = entity.uri.pathSegments.where((s) => s.isNotEmpty).last;
+      flavors.add(flavorName);
+    }
+  }
+
+  return flavors..sort();
+}
+
+/// Validate if a flavor exists in the iOS configuration
+Future<bool> validateIOSFlavor(String flavor) async {
+  final availableFlavors = await getAvailableIOSFlavors();
+  return availableFlavors.contains(flavor);
 }
 
 String _capitalize(String s) => s.isEmpty ? s : s[0].toUpperCase() + s.substring(1);
